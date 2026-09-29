@@ -10,12 +10,16 @@
  * 2. DNS 防泄漏增强：境外 DoH 双服务器冗余；AI 域名 DNS 锁定 ai 组出口
  * 3. 关键链路域名（*.cline.bot / *.commandcode.ai）固定走直连公共 DoH，且不参与 fake-ip：
  *    境外 nameserver 是 `#main`（经代理组出站），节点全挂时会把全机境外解析一起拖死，
- *    这两个域名落到 MATCH,main，正是受害面；实测它们不是污染目标（系统 DNS 与 223.5.5.5
- *    给出的都是同一个真实 IP），直连解析既不被污染也不依赖节点。
+ *    这两个域名落到 MATCH,final、默认仍在 main 上，正是受害面；实测它们不是污染目标
+ *    （系统 DNS 与 223.5.5.5 给出的都是同一个真实 IP），直连解析既不被污染也不依赖节点。
  * 4. DNS 监听收窄到 127.0.0.1:1053（原 0.0.0.0:1053）；TUN dns-hijack 不依赖对外监听。
  * 5. 清掉 BYPASS_DOMAINS / FORCE_PROXY_DOMAINS / CUSTOM_FILTER 里的示例占位符。
  * 6. 修 mergeRules 里的大小写比较 bug：`toUpperCase() === "MATCH,main"` 恒为 false，
- *    导致订阅里保留下来的直连规则被追加到 MATCH 之后、永不生效（现改为 "MATCH,MAIN"）。
+ *    导致订阅里保留下来的直连规则被追加到 MATCH 之后、永不生效（现改为 "MATCH,FINAL"）。
+ * 7. 新增 final 兜底组：MATCH 指向 final，兜底流量可在「前面各策略组 + DIRECT」里选出口，
+ *    而不是只能跟着 main 组走。final 默认指向 main，行为与旧版 MATCH,main 一致。
+ * 8. 可选 IPv6（ENABLE_IPV6）：DNS 打开 ipv6 并给出 fake-ip-range6。与顶层 ipv6 是
+ *    「与」关系（内核 ipv6 := dns.ipv6 && general.ipv6），客户端没开 IPv6 时自动失效。
  */
 
 // ====================
@@ -30,6 +34,16 @@ const FORCE_PROXY_DOMAINS = [];
 
 // 自定义节点过滤（用 | 分割；null = 不过滤任何节点）
 const CUSTOM_FILTER = null;
+
+// IPv6 支持。内核里 AAAA 放行条件是 dns.ipv6 与顶层 ipv6 同时为真（ipv6 := dns.ipv6 && general.ipv6），
+// 所以客户端整体没开 IPv6 时，这里打开也不会带来任何变化。
+// Bettbox 中顶层 ipv6 由应用内「IPv6」开关在脚本之后强制覆写，脚本管不到它；
+// 脚本能决定的是 DNS 侧：不打开这里，即使应用开了 IPv6，域名也永远解析不到 AAAA。
+const ENABLE_IPV6 = true;
+
+// IPv6 fake-ip 池。fake-ip 模式下 v6 池要单独给出，缺失时 AAAA 一律回空应答。
+// 与 Bettbox 的 fakeIpRangeV6 默认值保持一致。
+const FAKE_IP_RANGE6 = "2001:2::1/48";
 
 // 关键链路域名：本机中转链路的入口（cline 渠道 + commandcode 渠道）。
 // 见文件头第 3 条：解析必须与代理组可用性解耦，且不能拿 fake-ip。
@@ -158,7 +172,7 @@ const mergeRules = (baseRules = [], extraRules = []) => {
   const matchIndex = baseRules.findIndex(
     // 注意：左侧已 toUpperCase，右侧也必须是全大写——旧写法的 "MATCH,main" 永远不相等，
     // 于是保留下来的 profile 直连规则被追加到 MATCH 之后，成为永不生效的死规则。
-    (rule) => String(rule).trim().toUpperCase() === "MATCH,MAIN"
+    (rule) => String(rule).trim().toUpperCase() === "MATCH,FINAL"
   );
 
   if (matchIndex === -1) return uniq([...baseRules, ...extra]);
@@ -249,7 +263,7 @@ const STATIC_RULES = [
   "RULE-SET,gfw,main",
   "RULE-SET,cn,DIRECT",
   "RULE-SET,cn-ip,DIRECT,no-resolve",
-  "MATCH,main"
+  "MATCH,final"
 ];
 
 const STATIC_FAKE_IP_FILTER = buildFakeIpFilter(BYPASS_DOMAINS);
@@ -392,6 +406,19 @@ const buildProxyGroups = ({
     add("main", "select", mainEntries, "Available.png");
   }
 
+  // final 组：规则全部落空后的兜底出口（MATCH,final）。可选「前面各策略组」+ DIRECT，
+  // 想改兜底走向时不用动规则；默认第一项是 main，与旧版 MATCH,main 行为一致。
+  // 该组永远存在（至少含 DIRECT），因此无可用节点时也不会出现悬空的 MATCH 目标。
+  const finalEntries = [
+    ...(allNames.length ? ["main"] : []),
+    ...(allAiNames.length ? ["ai"] : []),
+    ...(allNames.length ? ["tg"] : []),
+    ...regionEntries,
+    ...(otherProxyNames.length ? ["Other"] : []),
+    "DIRECT"
+  ];
+  add("final", "select", finalEntries, "Final.png");
+
   // All 组
   if (allNames.length) {
     add("URL Test - All", "url-test", allNames, "Auto.png", SETTINGS.URL_TEST_EXTRA);
@@ -464,7 +491,8 @@ const buildProxyGroups = ({
       ...(allNames.length ? ["tg"] : []),
       ...regionEntries,
       ...(otherProxyNames.length ? ["Other"] : []),
-      ...(infoNames.length ? ["info"] : [])
+      ...(infoNames.length ? ["info"] : []),
+      "final"
     ],
     "Global.png"
   );
@@ -572,7 +600,11 @@ const applyDns = (cfg) => {
     enable: true,
     // 只服务本机的 DNS 模块（TUN dns-hijack 走内核内部转发，不依赖对外监听）
     listen: "127.0.0.1:1053",
-    ipv6: false,
+    // 顶层 ipv6 为假时，内核会把 AAAA 查询回成空应答（withResolver），
+    // 顶层为真而这一项为假时，域名解析同样拿不到 AAAA——只有 IPv6 字面量流量能走通。
+    ipv6: ENABLE_IPV6,
+    // fake-ip 模式下 AAAA 由独立的 v6 池分配，池为空时内核只回空应答（withFakeIP）。
+    "fake-ip-range6": ENABLE_IPV6 ? FAKE_IP_RANGE6 : "",
     "cache-algorithm": "arc",
     "prefer-h3": false,
     "use-hosts": true,
@@ -611,6 +643,12 @@ const applyProfile = (cfg) => {
     "store-selected": true,
     "store-fake-ip": false
   };
+};
+
+const applyIPv6 = (cfg) => {
+  // 顶层开关。Bettbox 会在脚本跑完之后用应用内「IPv6」开关覆写这一项，
+  // 所以这里主要是给其它 mihomo 客户端的默认值，也是本脚本 dns.ipv6 生效的前提。
+  cfg.ipv6 = ENABLE_IPV6;
 };
 
 const applyRuntime = (cfg) => {
@@ -683,6 +721,7 @@ function main(config) {
 
   removeGeoDataConfig(config);
   applyRuntime(config);
+  applyIPv6(config);
   applySniffer(config);
   applyTun(config);
   applyDns(config);
