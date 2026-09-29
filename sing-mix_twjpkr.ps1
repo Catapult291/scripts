@@ -8,24 +8,36 @@
  * 本地修改版（基于 sing-mix_origin）：
  * 1. TW/SG/JP/KR 合并为单一分组 TW_SG_JP_KR，删除独立 AS 分组（东南亚节点落入 Other 组）
  * 2. DNS 防泄漏增强：境外 DoH 双服务器冗余；AI 域名 DNS 锁定 ai 组出口
+ * 3. 关键链路域名（*.cline.bot / *.commandcode.ai）固定走直连公共 DoH，且不参与 fake-ip：
+ *    境外 nameserver 是 `#main`（经代理组出站），节点全挂时会把全机境外解析一起拖死，
+ *    这两个域名落到 MATCH,main，正是受害面；实测它们不是污染目标（系统 DNS 与 223.5.5.5
+ *    给出的都是同一个真实 IP），直连解析既不被污染也不依赖节点。
+ * 4. DNS 监听收窄到 127.0.0.1:1053（原 0.0.0.0:1053）；TUN dns-hijack 不依赖对外监听。
+ * 5. 清掉 BYPASS_DOMAINS / FORCE_PROXY_DOMAINS / CUSTOM_FILTER 里的示例占位符。
+ * 6. 修 mergeRules 里的大小写比较 bug：`toUpperCase() === "MATCH,main"` 恒为 false，
+ *    导致订阅里保留下来的直连规则被追加到 MATCH 之后、永不生效（现改为 "MATCH,MAIN"）。
  */
 
 // ====================
 // 0. 特殊处理
 // ====================
 
-// 强制直连
-const BYPASS_DOMAINS = [
-  "example.com", "example.org"
-];
+// 强制直连（按需填域名，留空即不启用）
+const BYPASS_DOMAINS = [];
 
-// 强制代理
-const FORCE_PROXY_DOMAINS = [
-  "test.com", "test.org"
-];
+// 强制代理（按需填域名，留空即不启用）
+const FORCE_PROXY_DOMAINS = [];
 
-// 自定义节点过滤（用 | 分割)
-const CUSTOM_FILTER = /示例占位符1|示例占位符2|示例占位符3/i;
+// 自定义节点过滤（用 | 分割；null = 不过滤任何节点）
+const CUSTOM_FILTER = null;
+
+// 关键链路域名：本机中转链路的入口（cline 渠道 + commandcode 渠道）。
+// 见文件头第 3 条：解析必须与代理组可用性解耦，且不能拿 fake-ip。
+const CRITICAL_DOMAINS = ["+.cline.bot", "+.commandcode.ai"];
+const CRITICAL_DIRECT_DNS = [
+  "https://dns.alidns.com/dns-query#DIRECT",
+  "https://doh.pub/dns-query#DIRECT"
+];
 
 // ====================
 // 1. 常量配置
@@ -144,7 +156,9 @@ const mergeRules = (baseRules = [], extraRules = []) => {
   if (!extra.length) return baseRules.slice();
 
   const matchIndex = baseRules.findIndex(
-    (rule) => String(rule).trim().toUpperCase() === "MATCH,main"
+    // 注意：左侧已 toUpperCase，右侧也必须是全大写——旧写法的 "MATCH,main" 永远不相等，
+    // 于是保留下来的 profile 直连规则被追加到 MATCH 之后，成为永不生效的死规则。
+    (rule) => String(rule).trim().toUpperCase() === "MATCH,MAIN"
   );
 
   if (matchIndex === -1) return uniq([...baseRules, ...extra]);
@@ -275,11 +289,13 @@ const makeProxyNamesUnique = (proxies = []) => {
   });
 };
 
-const filterCustomProxies = (proxies = [], customFilter) =>
-  proxies.filter((proxy) => {
+const filterCustomProxies = (proxies = [], customFilter) => {
+  if (!customFilter) return proxies.slice();   // 未配置过滤器：全保留
+  return proxies.filter((proxy) => {
     if (!proxy || !proxy.name) return false;
     return !customFilter.test(proxy.name);
   });
+};
 
 const splitInfoAndNormalProxies = (proxies = [], infoFilter) =>
   proxies.reduce(
@@ -517,6 +533,12 @@ const applyDns = (cfg) => {
     "https://8.8.8.8/dns-query#ai"
   ];
 
+  // 关键链路域名的 nameserver-policy（见文件头第 3 条）
+  const criticalNameserverPolicy = CRITICAL_DOMAINS.reduce((acc, domain) => {
+    acc[domain] = CRITICAL_DIRECT_DNS;
+    return acc;
+  }, {});
+
   const directRuleSetsForChinaDNS = [
     "rule-set:cn",
     "rule-set:google-cn",
@@ -548,7 +570,8 @@ const applyDns = (cfg) => {
   cfg.dns = {
     ...dns,
     enable: true,
-    listen: "0.0.0.0:1053",
+    // 只服务本机的 DNS 模块（TUN dns-hijack 走内核内部转发，不依赖对外监听）
+    listen: "127.0.0.1:1053",
     ipv6: false,
     "cache-algorithm": "arc",
     "prefer-h3": false,
@@ -557,10 +580,13 @@ const applyDns = (cfg) => {
     "respect-rules": true,
     "enhanced-mode": "fake-ip",
     "fake-ip-filter-mode": "blacklist",
-    "fake-ip-filter": fullFakeIpFilter,
+    // 关键链路域名必须拿真实 IP：fake-ip 映射不落盘（store-fake-ip=false），
+    // 内核重启后旧 fake-ip 失配会让客户端连到失效地址（表现为超时/重置）
+    "fake-ip-filter": uniq([...fullFakeIpFilter, ...CRITICAL_DOMAINS]),
     "default-nameserver": ["223.5.5.5", "119.29.29.29"],
     "nameserver-policy": {
-      "rule-set:category-ai-!cn": aiDNS
+      "rule-set:category-ai-!cn": aiDNS,
+      ...criticalNameserverPolicy
     },
     nameserver: foreignDNS,
     "proxy-server-nameserver": [
