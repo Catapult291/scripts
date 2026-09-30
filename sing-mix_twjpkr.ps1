@@ -20,6 +20,11 @@
  *    而不是只能跟着 main 组走。final 默认指向 main，行为与旧版 MATCH,main 一致。
  * 8. 可选 IPv6（ENABLE_IPV6）：DNS 打开 ipv6 并给出 fake-ip-range6。与顶层 ipv6 是
  *    「与」关系（内核 ipv6 := dns.ipv6 && general.ipv6），客户端没开 IPv6 时自动失效。
+ * 9. IP 检测域名钉在 main（FORCE_PROXY_DOMAINS 默认值）：Bettbox 首页「网络检测」按序探测
+ *    api.ip.sb → Cloudflare trace → api.ipify.org → api.ipinfo.io，这些域名既不在 gfw 也不在 cn，
+ *    规则全落空后走 MATCH,final。final 组一旦选 DIRECT，检测请求就直连、显示国内出口 IP，
+ *    看着像代理没生效。钉到 main 后检测结果与 final 的取值解耦：final 选什么都仍从 main 出站。
+ *    main 是 select 组且不含 DIRECT，做锚点不会被选成直连。
  */
 
 // ====================
@@ -30,7 +35,17 @@
 const BYPASS_DOMAINS = [];
 
 // 强制代理（按需填域名，留空即不启用）
-const FORCE_PROXY_DOMAINS = [];
+// 默认已带上 Bettbox 首页「网络检测」的探测域名，见文件头第 9 条。
+// 一律用精确域名（DOMAIN），不用 DOMAIN-SUFFIX：后者会把
+// challenges.cloudflare.com 一并拽进代理，而它本来由 RULE-SET,cloudflare 判直连。
+const FORCE_PROXY_DOMAINS = [
+  "api.ip.sb",
+  "cloudflare.com",
+  "www.cloudflare.com",
+  "cp.cloudflare.com",
+  "api.ipify.org",
+  "api.ipinfo.io"
+];
 
 // 自定义节点过滤（用 | 分割；null = 不过滤任何节点）
 const CUSTOM_FILTER = null;
