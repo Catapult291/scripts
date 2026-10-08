@@ -58,21 +58,24 @@ const SETTINGS = {
   // TW/SG/JP/KR 合并为 TW_SG_JP_KR 单一分组；原 AS 分组（东南亚）已移除
   REGION_ORDER: ["HK", "TW_SG_JP_KR", "US"],
 
+  // 不钉 timeout：写死 1 秒会把跨境节点里 TLS 握手偏慢（常见 0.8~2.5 s）的那些判死，而实时
+  // 故障切换靠 max-failed-times 已经能保证（连续失败即触发一次健康检查）。不写 timeout 时
+  // Bettbox 会按应用内「健康检查超时」写入（patch_config 只在组没有 timeout 时才写），
+  // 其它内核用默认 5000。
   URL_TEST_EXTRA: {
     hidden: true,
     url: "https://www.g.cn/generate_204",
     interval: 900,
     tolerance: 100,
     lazy: true,
-    timeout: 1000,
     "max-failed-times": 1,
   },
 
+  // 同上：不钉 timeout，交给应用设置 / 内核默认
   FALLBACK_TEST_EXTRA: {
     url: "https://www.g.cn/generate_204",
     interval: 900,
     lazy: true,
-    timeout: 1000,
     "max-failed-times": 1,
   },
 
@@ -179,22 +182,33 @@ const buildFakeIpFilter = (bypass = []) =>
     )
   ]);
 
+// 订阅自带的直连规则要插在「第一条泛化代理规则」之前：旧做法插在 MATCH 之前，它们排在
+// RULE-SET,gfw,main 与 ai/tg 分类规则之后，对 gfw 域名根本轮不到生效（等于白留）。
+// 锚点选 gfw 而不是所有指向代理组的规则，有两处有意保留的优先级：
+//   * FORCE_PROXY_DOMAINS 那几条是网络检测的锚点，要保持脚本可控；
+//   * ai / tg 的分类优先（AI 走独立出口降风控、Telegram 直连在部分网络不通）。
+// 想让订阅规则连这两类也盖过去，把锚点换成 /,(?:main|ai|tg)$/ 即可。
+const EXTRA_RULES_ANCHOR = /^RULE-SET,gfw,main$/i;
+
 const mergeRules = (baseRules = [], extraRules = []) => {
   const extra = Array.isArray(extraRules) ? extraRules.filter(Boolean) : [];
   if (!extra.length) return baseRules.slice();
 
-  const matchIndex = baseRules.findIndex(
-    // 注意：左侧已 toUpperCase，右侧也必须是全大写——旧写法的 "MATCH,main" 永远不相等，
-    // 于是保留下来的 profile 直连规则被追加到 MATCH 之后，成为永不生效的死规则。
-    (rule) => String(rule).trim().toUpperCase() === "MATCH,FINAL"
-  );
+  let insertIndex = baseRules.findIndex((rule) => EXTRA_RULES_ANCHOR.test(String(rule).trim()));
+  if (insertIndex === -1) {
+    insertIndex = baseRules.findIndex(
+      // 注意：左侧已 toUpperCase，右侧也必须是全大写——旧写法的 "MATCH,main" 永远不相等，
+      // 于是保留下来的 profile 直连规则被追加到 MATCH 之后，成为永不生效的死规则。
+      (rule) => String(rule).trim().toUpperCase() === "MATCH,FINAL"
+    );
+  }
 
-  if (matchIndex === -1) return uniq([...baseRules, ...extra]);
+  if (insertIndex === -1) return uniq([...baseRules, ...extra]);
 
   return uniq([
-    ...baseRules.slice(0, matchIndex),
+    ...baseRules.slice(0, insertIndex),
     ...extra,
-    ...baseRules.slice(matchIndex)
+    ...baseRules.slice(insertIndex)
   ]);
 };
 
@@ -457,7 +471,9 @@ const buildProxyGroups = ({
   // provider 模式下给叶子组补 use（地区筛选交给 filter）
   const withProviders = (extra = {}) => (hasProvider ? { ...extra, use: providers } : extra);
 
-  add("fcm", "select", ["DIRECT"], "Google_Search.png", { hidden: true });
+  // 这里原本还有一个 hidden 的 `fcm` 组（["DIRECT"]），但没有任何规则或分组引用它，
+  // 而 FCM 已由 STATIC_RULES 的 RULE-SET,googlefcm,DIRECT 直接判直连，故删除。
+  // 想要「FCM 从哪个出口走」的手动开关：把那条规则的 DIRECT 换成 fcm，并去掉 hidden。
 
   // 有哪些地区组：内联侧出现过的地区；provider 模式下三个地区组都建（内容运行期筛）
   const regionEntries = SETTINGS.REGION_ORDER.filter((rName) => {
@@ -614,6 +630,10 @@ const applySniffer = (cfg) => {
   };
 };
 
+// 注：这一整段在 Bettbox 里基本被应用侧补丁覆盖（enable / device / stack / dns-hijack /
+// auto-route / auto-detect-interface / auto-redirect / strict-route 都由应用写入，见
+// rust/bettbox-native/src/patch_config.rs），这里主要是给其它 mihomo 客户端的默认值；
+// 在 Bettbox 里真正由脚本决定的是规则、DNS 与分组。
 const applyTun = (cfg) => {
   cfg.tun = {
     ...(cfg.tun || {}),
@@ -622,7 +642,9 @@ const applyTun = (cfg) => {
     "auto-route": true,
     "auto-detect-interface": true,
     "strict-route": true,
-    "dns-hijack": ["any:53", "tcp://any:53"]
+    // 只留 any:53：内核会把 `tcp://any:53` 的前缀裁掉、any 换成 0.0.0.0，与 any:53 完全相同
+    // （listener/sing_tun/server.go），而 TUN 的 dns-hijack 本来就同时接管 UDP/TCP。
+    "dns-hijack": ["any:53"]
   };
 };
 
@@ -711,7 +733,11 @@ const applyDns = (cfg, { hasProxyGroups = true } = {}) => {
     // 内核重启后旧 fake-ip 失配会让客户端连到失效地址（表现为超时/重置）
     "fake-ip-filter": uniq([...fullFakeIpFilter, ...CRITICAL_DOMAINS]),
     "default-nameserver": ["223.5.5.5", "119.29.29.29"],
+    // 订阅自带的 nameserver-policy 合并进来，脚本点名的键以脚本为准。内核的 policy 键按最长
+    // 匹配生效、没有真正的全捕获键（`*` 只匹配单标签域名），故订阅里宽泛的键最多影响它点名的
+    // 那部分域名；真遇到塞了 `+.com` 这类宽泛键的订阅，把下面第一行展开去掉即可。
     "nameserver-policy": {
+      ...(dns["nameserver-policy"] || {}),
       ...(hasProxyGroups ? { "rule-set:category-ai-!cn": aiDNS } : {}),
       ...criticalNameserverPolicy
     },
@@ -723,7 +749,10 @@ const applyDns = (cfg, { hasProxyGroups = true } = {}) => {
     "direct-nameserver": chinaDNS
   };
 
+  // 合并而不是整段覆盖：订阅自带的 hosts 条目保留下来，同名的以脚本为准（脚本这几条分别是
+  // DoH 引导与定向屏蔽，必须由脚本说了算）。
   cfg.hosts = {
+    ...(cfg.hosts || {}),
     "dns.alidns.com": ["223.5.5.5", "223.6.6.6"],
     "doh.pub": ["1.12.12.12", "120.53.53.53"],
     "services.googleapis.cn": ["services.googleapis.com"],
