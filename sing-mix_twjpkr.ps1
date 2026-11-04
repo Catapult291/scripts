@@ -23,6 +23,30 @@ const FORCE_PROXY_DOMAINS = [
   "api.ipinfo.io"
 ];
 
+// 屏蔽域名：小米/红米内置反诈中心与 MIUI 统计上报的采集端点（列表来自 linux.do 主题
+// 3103560 第 50 楼）。两路同时下发：
+//   * 规则侧 `DOMAIN-SUFFIX,<域>,REJECT` 排在最前，盖住经代理的流量（含嗅探还原出的域名）；
+//   * hosts 侧 `+.` 前缀让域名与子域都解析到 0.0.0.0（trie 的 `+.` 会同时插入精确域名与
+//     子域通配），查询不外发；hosts 的优先级高于 fake-ip，解析阶段就断链。
+// 列表覆盖安装器、安全扫描等系统组件，屏蔽后对应功能可能不可用；出问题就把那一项删掉。
+const BLOCK_DOMAINS = [
+  "fraud-detection.engine.miui.com",
+  "flash.sec.miui.com",
+  "dm.wo.com.cn",
+  "sec-cdn.open.mistat.xiaomi.com",
+  "data.mistat.xiaomi.com",
+  "tracking.miui.com",
+  "adv.sec.miui.com",
+  "xlmc.sec.miui.com",
+  "etl.xlmc.sec.miui.com",
+  "security.browser.miui.com",
+  "ixav-cse.avlyun.com",
+  "logupdate.avlyun.sec.miui.com",
+  "mazu.sec.miui.com",
+  "api.installer.xiaomi.com",
+  "api.sec.miui.com"
+];
+
 // 自定义节点过滤：命中的节点从所有节点组里剔除（节点本身仍留在 proxies）。正则字面量
 // （/官网|剩余/i）和字符串（"官网|剩余"，按不区分大小写编译）都接受；null = 不过滤任何节点。
 const CUSTOM_FILTER = null;
@@ -275,6 +299,7 @@ const buildRuleProviders = () => {
 const STATIC_RULES = [
   "RULE-SET,category-ads-all,REJECT",
 
+  ...uniq(BLOCK_DOMAINS).map((d) => `DOMAIN-SUFFIX,${d},REJECT`),
   ...uniq(BYPASS_DOMAINS).map((d) => `DOMAIN-SUFFIX,${d},DIRECT`),
   ...uniq(FORCE_PROXY_DOMAINS).map((d) => `DOMAIN,${d},main`),
 
@@ -306,6 +331,13 @@ const STATIC_RULES_NO_NODES = STATIC_RULES.map((rule) =>
 );
 
 const STATIC_FAKE_IP_FILTER = buildFakeIpFilter(BYPASS_DOMAINS);
+
+// 屏蔽域名的 hosts 形态：`+.` 在 trie 里同时插入精确域名与子域通配，一条覆盖整棵子树。
+const buildBlockedHosts = (domains = []) =>
+  uniq(domains).reduce((hosts, domain) => {
+    hosts[`+.${domain}`] = ["0.0.0.0"];
+    return hosts;
+  }, {});
 
 // ====================
 // 4. 节点处理
@@ -764,9 +796,10 @@ const applyDns = (cfg, { hasProxyGroups = true } = {}) => {
   };
 
   // 合并而不是整段覆盖：订阅自带的 hosts 条目保留下来，同名的以脚本为准（脚本这几条分别是
-  // DoH 引导与定向屏蔽，必须由脚本说了算）。
+  // DoH 引导、定向屏蔽与 BLOCK_DOMAINS，必须由脚本说了算）。
   cfg.hosts = {
     ...(cfg.hosts || {}),
+    ...buildBlockedHosts(BLOCK_DOMAINS),
     "dns.alidns.com": ["223.5.5.5", "223.6.6.6"],
     "doh.pub": ["1.12.12.12", "120.53.53.53"],
     "services.googleapis.cn": ["services.googleapis.com"],
