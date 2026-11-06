@@ -29,6 +29,8 @@ const FORCE_PROXY_DOMAINS = [
 //   * hosts 侧 `+.` 前缀让域名与子域都解析到 0.0.0.0（trie 的 `+.` 会同时插入精确域名与
 //     子域通配），查询不外发；hosts 的优先级高于 fake-ip，解析阶段就断链。
 // 列表覆盖安装器、安全扫描等系统组件，屏蔽后对应功能可能不可用；出问题就把那一项删掉。
+// zzhc.vnet.cn 是中国电信 vnet.cn 弹窗/PUSH 广告家族的成员（easylistchina 收录了同族的
+// welcome.ah.vnet.cn 等），与上面的 MIUI 列表无关，属手动追加项。
 const BLOCK_DOMAINS = [
   "fraud-detection.engine.miui.com",
   "flash.sec.miui.com",
@@ -44,7 +46,9 @@ const BLOCK_DOMAINS = [
   "logupdate.avlyun.sec.miui.com",
   "mazu.sec.miui.com",
   "api.installer.xiaomi.com",
-  "api.sec.miui.com"
+  "api.sec.miui.com",
+  // 电信 vnet.cn 弹窗广告域名
+  "zzhc.vnet.cn"
 ];
 
 // 自定义节点过滤：命中的节点从所有节点组里剔除（节点本身仍留在 proxies）。正则字面量
